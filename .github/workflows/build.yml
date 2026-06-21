@@ -1,0 +1,214 @@
+name: Build native plugins
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish build artifacts to a GitHub Release"
+        required: true
+        default: false
+        type: boolean
+      tag_name:
+        description: "Release tag. Defaults to manual-<run_number> when publishing."
+        required: false
+        default: ""
+        type: string
+      release_name:
+        description: "Release title. Defaults to the release tag."
+        required: false
+        default: ""
+        type: string
+      prerelease:
+        description: "Mark the release as a prerelease"
+        required: true
+        default: false
+        type: boolean
+      draft:
+        description: "Create the release as a draft"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  PLUGIN_NAME: cpa-516-blocker
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+  build-linux:
+    name: Build Linux ${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            cc: gcc
+            apt_packages: ""
+          - goarch: arm64
+            cc: aarch64-linux-gnu-gcc
+            apt_packages: gcc-aarch64-linux-gnu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cross compiler
+        if: matrix.apt_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Build shared library
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+        run: |
+          set -euo pipefail
+          rm -rf dist package packages
+          mkdir -p dist package packages
+
+          go build -buildmode=c-shared -trimpath -ldflags="-s -w" -o "dist/${PLUGIN_NAME}.so" .
+
+          package_dir="package/${PLUGIN_NAME}-linux-${GOARCH}"
+          mkdir -p "${package_dir}"
+          cp "dist/${PLUGIN_NAME}.so" "${package_dir}/"
+          cp "dist/${PLUGIN_NAME}.h" "${package_dir}/"
+          cp README.md config.example.yaml "${package_dir}/"
+
+          tar -C package -czf "packages/${PLUGIN_NAME}-linux-${GOARCH}.tar.gz" "${PLUGIN_NAME}-linux-${GOARCH}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PLUGIN_NAME }}-linux-${{ matrix.goarch }}
+          path: packages/*.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows amd64
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup MinGW
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Build shared library
+        shell: pwsh
+        env:
+          CGO_ENABLED: "1"
+          GOOS: windows
+          GOARCH: amd64
+          CC: gcc
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+
+          Remove-Item -Recurse -Force dist, package, packages -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force dist, package, packages | Out-Null
+
+          go build -buildmode=c-shared -trimpath -ldflags="-s -w" -o "dist/$env:PLUGIN_NAME.dll" .
+
+          $packageDir = "package/$env:PLUGIN_NAME-windows-amd64"
+          New-Item -ItemType Directory -Force $packageDir | Out-Null
+          Copy-Item "dist/$env:PLUGIN_NAME.dll" $packageDir
+          Copy-Item "dist/$env:PLUGIN_NAME.h" $packageDir -ErrorAction SilentlyContinue
+          Copy-Item README.md $packageDir
+          Copy-Item config.example.yaml $packageDir
+
+          Compress-Archive -Path "$packageDir/*" -DestinationPath "packages/$env:PLUGIN_NAME-windows-amd64.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PLUGIN_NAME }}-windows-amd64
+          path: packages/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    if: inputs.publish_release
+    needs:
+      - build-linux
+      - build-windows
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum * > SHA256SUMS
+
+      - name: Resolve release metadata
+        id: release_meta
+        env:
+          INPUT_TAG: ${{ inputs.tag_name }}
+          INPUT_NAME: ${{ inputs.release_name }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG}"
+          if [ -z "${tag}" ]; then
+            tag="manual-${GITHUB_RUN_NUMBER}"
+          fi
+          name="${INPUT_NAME}"
+          if [ -z "${name}" ]; then
+            name="${tag}"
+          fi
+          {
+            echo "tag=${tag}"
+            echo "name=${name}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          name: ${{ steps.release_meta.outputs.name }}
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: release-assets/*

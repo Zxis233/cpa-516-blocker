@@ -1,0 +1,13 @@
+plugins:
+  enabled: true
+  dir: plugins
+  configs:
+    cpa-516-blocker:
+      enabled: true
+      priority: 100
+      target_reasoning_tokens: 516
+      retry_status: 429
+      error_code: "RETRY_REQUIRED_REASONING_516"
+      error_message: "[RETRY_REQUIRED_REASONING_516] reasoning_tokens=516; discard this response and resend the request."
+      match_requests: true
+      match_stream_responses: true
